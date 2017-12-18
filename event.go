@@ -11,6 +11,7 @@ type Event struct {
 	msgType    string
 	fromUserId uint64
 	toUserId   uint64
+	index      int // Index in an event priority heap
 }
 
 type Empty struct {
@@ -73,4 +74,37 @@ func (e Event) toString() string {
 		return fmt.Sprintf("%d|%s|%d|%d", e.sequence, e.msgType, e.fromUserId, e.toUserId)
 	}
 	return "" // Just a fall back. We should never reach this point because the value of the msgType is checked already
+}
+
+// sequenceQueue is a priority queue used for messages that came out of order
+// and should be stored sorted using the heap interface
+type sequenceQueue []Event
+
+func (sq sequenceQueue) Len() int { return len(sq) }
+
+func (sq sequenceQueue) Less(i, j int) bool {
+	// Pop should give us the lowest sequence number first
+	return sq[i].sequence < sq[j].sequence
+}
+
+func (sq sequenceQueue) Swap(i, j int) {
+	sq[i], sq[j] = sq[j], sq[i]
+	sq[i].index = i
+	sq[j].index = j
+}
+
+func (sq *sequenceQueue) Push(x interface{}) {
+	n := len(*sq)
+	item := x.(Event)
+	item.index = n
+	*sq = append(*sq, item)
+}
+
+func (sq *sequenceQueue) Pop() interface{} {
+	old := *sq
+	n := len(old)
+	item := old[n-1]
+	item.index = -1 // for safety
+	*sq = old[0: n-1]
+	return item
 }

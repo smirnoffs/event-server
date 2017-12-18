@@ -7,7 +7,7 @@ import (
 	"bufio"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"container/heap"
 )
 
 const (
@@ -17,75 +17,26 @@ const (
 )
 
 var clients = make(map[uint64]clientConnection) // connected clients
-var chanEvents = make(chan Event)
-var sentSeq uint64 = 0 // to keep track the number of sent
+var nextMessageSeq uint64 = 1
+var queue = make(sequenceQueue, 0)
+var pushEventChan = make(chan Event)
+var heapChanged = make(chan bool)
+var quitChan = make(chan bool)
 
 func main() {
+	heap.Init(&queue)
 	go runEventListener()
 	// Close client connections at the end of the execution
 	defer closeClientConnections()
 	go runClientListener()
+	go pushNewEventToQueue()
+	go watchPriorityQueue()
 	for {
-		incomingEvent := <-chanEvents
-		go proceedEvent(incomingEvent)
-	}
-}
-
-// Decides what to do with the event
-func proceedEvent(event Event) {
-	for i := event.sequence; i <= sentSeq; {
-		log.Println(sentSeq, event.sequence)
-		switch event.msgType {
-		case "F": // Follow. Only the `To User Id` should be notified
-			client, present := clients[event.toUserId]
-			// In case if the event contains the id of the non-registered user
-			if present == false {
-				log.Println("Wrong subscription request, To User Id doesn't exist: ", event.toString())
-				return
-			}
-			client.followers[event.fromUserId] = true
-			go sendMessage(client, event)
-		case "U": // Unfollow. No clients should be notified
-			unfollow, present := clients[event.toUserId]
-			// In case if the event contains the id of the non-registered user
-			if present == false {
-				log.Println("Wrong unfollow request, To User Id doesn't exist: ", event.toString())
-				return
-			}
-			delete(unfollow.followers, event.fromUserId)
-			atomic.AddUint64(&sentSeq, 1)
-		case "B": // Broadcast. All connected user clients should be notified
-			for _, client := range clients {
-				go sendMessage(client, event)
-			}
-		case "P": // Private message. Only the `To User Id` should be notified
-			client, present := clients[event.toUserId]
-			if present == false {
-				log.Printf("Discharging the message to the non-registered client")
-				return
-			}
-			go sendMessage(client, event)
-		case "S": // Status update. All current followers of the `From User ID` should be notified
-			followers := clients[event.fromUserId].followers
-			for followerId := range followers {
-				client, present := clients[followerId]
-				if present == false {
-					log.Fatalln("There is no connection registered for subsriber %d. Event %s", followerId,
-						event.toString())
-				}
-				go sendMessage(client, event)
-			}
+		select {
+		case <-quitChan:
+			return
 		}
 	}
-}
-
-func sendMessage(client clientConnection, event Event) {
-	log.Printf("Current sequense for %d is %d. Message seq %d", client.id,
-		client.messageSeqToSend, event.sequence)
-	log.Printf("Sending event: %#v (%s)", event, event.toString())
-	client.connection.Write([]byte(event.toString() + "\n"))
-	atomic.AddUint64(&sentSeq, 1)
-	return
 }
 
 // Listen to incoming connections with events
@@ -103,6 +54,44 @@ func runEventListener() {
 	}
 	log.Println("Ready to accept events")
 	go handleEventRequest(eventConn)
+}
+
+// Handles incoming events
+func handleEventRequest(conn net.Conn) {
+	scanner := bufio.NewScanner(conn)
+	for scanner.Scan() {
+		// Builds the event.
+		nextLine := scanner.Text()
+		log.Println("Event received: ", nextLine, "Next to send:", nextMessageSeq)
+		event, err := newEventFromString(nextLine)
+		if err != nil {
+			log.Println("Event error:", err)
+		} else {
+			pushEventChan <- event
+		}
+	}
+}
+
+// Watch for push to the priority queue,
+// in case of the correct event sequence, pop the message to pop channel
+func pushNewEventToQueue() {
+	for {
+		event := <-pushEventChan
+		heap.Push(&queue, event)
+		heapChanged <- true
+	}
+}
+
+func watchPriorityQueue() {
+	for {
+		if <-heapChanged {
+			nextMessage := nextMessageSeq
+			if len(queue) > 0 && queue[0].sequence == nextMessage {
+				event := heap.Pop(&queue).(Event)
+				 go proceedEvent(event)
+			}
+		}
+	}
 }
 
 // Listen to incoming connections from clients
@@ -124,21 +113,62 @@ func runClientListener() {
 	}
 }
 
-// Handles incoming events
-func handleEventRequest(conn net.Conn) {
-	scanner := bufio.NewScanner(conn)
-	for scanner.Scan() {
-		// Builds the event.
-		nextLine := scanner.Text()
-		log.Println("Event received: ", nextLine)
-		event, err := newEventFromString(nextLine)
-		if err != nil {
-			log.Println("Event error:", err)
-		} else {
-			chanEvents <- event
+func triggerNextHeapCheck(seq uint64) {
+	nextMessageSeq = seq
+	heapChanged <- true
+}
+
+// Decides what to do with the event
+func proceedEvent(event Event) {
+	defer triggerNextHeapCheck(event.sequence + 1)
+	log.Printf("Proceeding event %s", event.toString())
+	switch event.msgType {
+	case "F": // Follow. Only the `To User Id` should be notified
+		client, present := clients[event.toUserId]
+		// In case if the event contains the id of the non-registered user
+		if present == false {
+			log.Println("Wrong subscription request, To User Id doesn't exist: ", event.toString())
+			break
+		}
+		client.followers[event.fromUserId] = true
+		go sendMessage(client, event)
+	case "U": // Unfollow. No clients should be notified
+		client, present := clients[event.toUserId]
+		// In case if the event contains the id of the non-registered user
+		if present == false {
+			log.Println("Wrong unfollow request, To User Id doesn't exist: ", event.toString())
+			break
+		}
+		delete(client.followers, event.fromUserId)
+	case "B": // Broadcast. All connected user clients should be notified
+		for _, client := range clients {
+			sendMessage(client, event)
+		}
+	case "P": // Private message. Only the `To User Id` should be notified
+		client, present := clients[event.toUserId]
+		if present == false {
+			log.Printf("Discharging the message to the non-registered client")
+			break
+		}
+		sendMessage(client, event)
+	case "S": // Status update. All current followers of the `From User ID` should be notified
+		followers := clients[event.fromUserId].followers
+		for followerId := range followers {
+			client, present := clients[followerId]
+			if present == false {
+				log.Printf("There is no connection registered for subsriber %d. Event %s", followerId,
+					event.toString())
+				break
+			}
+			sendMessage(client, event)
 		}
 	}
+}
 
+func sendMessage(client clientConnection, event Event) {
+	log.Printf("Event sent: %s", event.toString())
+	client.connection.Write([]byte(event.toString() + "\n"))
+	return
 }
 
 // Handles client requests. Adds connection to a pool of active connections
