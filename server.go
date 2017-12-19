@@ -37,6 +37,9 @@ var (
 	quitChan      = make(chan bool)
 
 	mutex = &sync.Mutex{} // for safe modification of the heap with events
+
+	// newbie log level control
+	debug = getenv("DEBUG", "false") == "true"
 )
 
 func main() {
@@ -78,10 +81,14 @@ func handleEventRequest(conn net.Conn) {
 	for scanner.Scan() {
 		// Builds events
 		nextLine := scanner.Text()
-		log.Println("Event received: ", nextLine)
+		if debug {
+			log.Println("Event received: ", nextLine)
+		}
 		event, err := newEventFromString(nextLine)
 		if err != nil {
-			log.Println("Event error:", err)
+			if debug {
+				log.Println("Event error:", err)
+			}
 		} else {
 			pushEventChan <- event
 		}
@@ -104,7 +111,9 @@ func newEventToBucket() {
 func watchEventBucket() {
 	for {
 		if <-bucketChanged {
-			log.Println("Next to proceed:", nextMessageSeq)
+			if debug {
+				log.Println("Next to proceed:", nextMessageSeq)
+			}
 			mutex.Lock()
 			_, present := eventsBucket[nextMessageSeq]
 			mutex.Unlock()
@@ -149,13 +158,17 @@ func triggerNextHeapCheck(seq uint64) {
 // Dispatches an event
 func proceedEvent(event Event) {
 	defer triggerNextHeapCheck(event.sequence + 1)
-	log.Printf("Proceeding event %s", event.original)
+	if debug {
+		log.Printf("Proceeding event %s", event.original)
+	}
 	switch event.msgType {
 	case "F": // Follow. Only the `To User Id` should be notified
 		client, present := clients[event.toUserId]
 		// In case if the event contains the id of the non-registered user
 		if present == false {
-			log.Println("Wrong subscription request, To User Id doesn't exist: ", event.original)
+			if debug {
+				log.Println("Wrong subscription request, To User Id doesn't exist: ", event.original)
+			}
 		} else {
 			sendMessage(client, event)
 		}
@@ -173,7 +186,9 @@ func proceedEvent(event Event) {
 	case "P": // Private message. Only the `To User Id` should be notified
 		client, present := clients[event.toUserId]
 		if present == false {
-			log.Printf("Discharging the message to the non-registered client %d", event.toUserId)
+			if debug {
+				log.Printf("Discharging the message to the non-registered client %d", event.toUserId)
+			}
 		} else {
 			sendMessage(client, event)
 		}
@@ -182,8 +197,10 @@ func proceedEvent(event Event) {
 		for k := range followers[event.fromUserId] {
 			client, present := clients[k]
 			if present == false {
-				log.Printf("There is no connection registered for subsriber %d. Event %s", k,
-					event.original)
+				if debug {
+					log.Printf("There is no connection registered for subsriber %d. Event %s", k,
+						event.original)
+				}
 			} else {
 				sendMessage(client, event)
 			}
@@ -193,7 +210,9 @@ func proceedEvent(event Event) {
 
 // Sends the message to the opened connection
 func sendMessage(connection net.Conn, event Event) {
-	log.Printf("Event sent: %s", event.original)
+	if debug {
+		log.Printf("Event sent: %s", event.original)
+	}
 	connection.Write([]byte(event.original + "\n"))
 }
 
