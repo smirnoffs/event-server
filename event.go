@@ -33,7 +33,7 @@ func newEventFromString(stringEvent string) (Event, error) {
 
 	switch {
 	case len(data) == 1 || (len(data) == 2 && data[1] != "B"):
-		return event, fmt.Errorf("event is incomplete %v, data: %#v", stringEvent, data)
+		return event, fmt.Errorf("event is incomplete %s", stringEvent)
 	case len(data) > 4:
 		return event, fmt.Errorf("event is too long %v", stringEvent)
 	case len(data) == 2 && data[1] == "B":

@@ -43,7 +43,10 @@ var (
 )
 
 func main() {
-	//heap.Init(&queue)
+	runService()
+}
+
+func runService() {
 	go runEventListener()
 	// Close client connections at the end of the execution
 	defer closeClientConnections()
