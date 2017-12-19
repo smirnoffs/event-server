@@ -9,24 +9,36 @@ import (
 	"strings"
 	"container/heap"
 	"sync"
+	"os"
 )
+
+func getenv(key, fallback string) string {
+	value := os.Getenv(key)
+	if len(value) == 0 {
+		return fallback
+	}
+	return value
+}
 
 const (
-	host       = "localhost"
-	eventPort  = "9090"
-	clientPort = "9099"
+	host = "localhost"
 )
 
-var clients = make(map[uint64]net.Conn) // connected clients
-var nextMessageSeq uint64 = 1
-var followers = make(map[uint64]map[uint64]struct{})
+var (
+	eventPort  = getenv("EVENT_PORT", "9090")
+	clientPort = getenv("CLIENT_PORT", "9099")
 
-var queue = make(sequenceQueue, 0)
-var pushEventChan = make(chan Event)
-var heapChanged = make(chan bool)
-var quitChan = make(chan bool)
+	clients               = make(map[uint64]net.Conn) // connected clients
+	nextMessageSeq uint64 = 1
+	followers             = make(map[uint64]map[uint64]struct{})
 
-var mutex = &sync.Mutex{} // for safe modification of the heap with events
+	queue         = make(sequenceQueue, 0)
+	pushEventChan = make(chan Event)
+	heapChanged   = make(chan bool)
+	quitChan      = make(chan bool)
+
+	mutex = &sync.Mutex{} // for safe modification of the heap with events
+)
 
 func main() {
 	heap.Init(&queue)
