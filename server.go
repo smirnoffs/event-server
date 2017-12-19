@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"strconv"
 	"strings"
-	"container/heap"
 	"sync"
 	"os"
 )
@@ -30,24 +29,24 @@ var (
 
 	clients               = make(map[uint64]net.Conn) // connected clients
 	nextMessageSeq uint64 = 1
+	eventsBucket          = make(map[uint64]Event)
 	followers             = make(map[uint64]map[uint64]struct{})
 
-	queue         = make(sequenceQueue, 0)
 	pushEventChan = make(chan Event)
-	heapChanged   = make(chan bool)
+	bucketChanged = make(chan bool)
 	quitChan      = make(chan bool)
 
 	mutex = &sync.Mutex{} // for safe modification of the heap with events
 )
 
 func main() {
-	heap.Init(&queue)
+	//heap.Init(&queue)
 	go runEventListener()
 	// Close client connections at the end of the execution
 	defer closeClientConnections()
 	go runClientListener()
-	go pushNewEventToQueue()
-	go watchPriorityQueue()
+	go newEventToBucket()
+	go watchEventBucket()
 	for {
 		select {
 		case <-quitChan:
@@ -77,7 +76,7 @@ func runEventListener() {
 func handleEventRequest(conn net.Conn) {
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
-		// Builds the event.
+		// Builds events
 		nextLine := scanner.Text()
 		log.Println("Event received: ", nextLine)
 		event, err := newEventFromString(nextLine)
@@ -89,36 +88,35 @@ func handleEventRequest(conn net.Conn) {
 	}
 }
 
-// Watch for push to the priority queue,
-// in case of the correct event sequence, pop the message to pop channel
-func pushNewEventToQueue() {
+// Add an Event into the bucket and notify the channel that the bucket has been changed
+func newEventToBucket() {
 	for {
 		event := <-pushEventChan
 		mutex.Lock()
-		heap.Push(&queue, event)
+		eventsBucket[event.sequence] = event
 		mutex.Unlock()
-		heapChanged <- true
+		bucketChanged <- true
 	}
 }
 
 // On each heap modification checks if the event with nextMessageSeq sequence number is in the top of the heap and
 // sends the event to proceedEvent
-func watchPriorityQueue() {
+func watchEventBucket() {
 	for {
-		if <-heapChanged {
-			nextMessage := nextMessageSeq
-			log.Println("Next to proceed:", nextMessage)
-			if len(queue) > 0 && queue[0].sequence == nextMessage {
+		if <-bucketChanged {
+			log.Println("Next to proceed:", nextMessageSeq)
+			mutex.Lock()
+			_, present := eventsBucket[nextMessageSeq]
+			mutex.Unlock()
+			if present == true {
 				mutex.Lock()
-				event := heap.Pop(&queue).(Event)
+				event := eventsBucket[nextMessageSeq]
+				delete(eventsBucket, nextMessageSeq)
 				mutex.Unlock()
 				go proceedEvent(event)
-				if len(queue) > 0 {
-					log.Printf("Submitted %d. Next in the queue: %d", event.sequence, queue[0].sequence)
-				} else {
-					log.Printf("Submitted %d. The queue is empty", event.sequence)
-				}
+
 			}
+
 		}
 	}
 }
@@ -142,22 +140,22 @@ func runClientListener() {
 	}
 }
 
-// Increments nextMessageSeq and notifies heapChanged channel
+// Increments nextMessageSeq and notifies bucketChanged channel
 func triggerNextHeapCheck(seq uint64) {
 	nextMessageSeq = seq
-	heapChanged <- true
+	bucketChanged <- true
 }
 
 // Dispatches an event
 func proceedEvent(event Event) {
 	defer triggerNextHeapCheck(event.sequence + 1)
-	log.Printf("Proceeding event %s", event.toString())
+	log.Printf("Proceeding event %s", event.original)
 	switch event.msgType {
 	case "F": // Follow. Only the `To User Id` should be notified
 		client, present := clients[event.toUserId]
 		// In case if the event contains the id of the non-registered user
 		if present == false {
-			log.Println("Wrong subscription request, To User Id doesn't exist: ", event.toString())
+			log.Println("Wrong subscription request, To User Id doesn't exist: ", event.original)
 		} else {
 			sendMessage(client, event)
 		}
@@ -185,7 +183,7 @@ func proceedEvent(event Event) {
 			client, present := clients[k]
 			if present == false {
 				log.Printf("There is no connection registered for subsriber %d. Event %s", k,
-					event.toString())
+					event.original)
 			} else {
 				sendMessage(client, event)
 			}
@@ -195,8 +193,8 @@ func proceedEvent(event Event) {
 
 // Sends the message to the opened connection
 func sendMessage(connection net.Conn, event Event) {
-	log.Printf("Event sent: %s", event.toString())
-	connection.Write([]byte(event.toString() + "\n"))
+	log.Printf("Event sent: %s", event.original)
+	connection.Write([]byte(event.original + "\n"))
 }
 
 // Handles client requests. Adds connection to a pool of active connections
