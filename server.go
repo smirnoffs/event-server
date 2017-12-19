@@ -150,14 +150,14 @@ func runClientListener() {
 }
 
 // Increments nextMessageSeq and notifies bucketChanged channel
-func triggerNextHeapCheck(seq uint64) {
+func triggerNextBucketCheck(seq uint64) {
 	nextMessageSeq = seq
 	bucketChanged <- true
 }
 
 // Dispatches an event
 func proceedEvent(event Event) {
-	defer triggerNextHeapCheck(event.sequence + 1)
+	defer triggerNextBucketCheck(event.sequence + 1)
 	if debug {
 		log.Printf("Proceeding event %s", event.original)
 	}
