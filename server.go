@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"container/heap"
+	"sync"
 )
 
 const (
@@ -16,12 +17,16 @@ const (
 	clientPort = "9099"
 )
 
-var clients = make(map[uint64]clientConnection) // connected clients
+var clients = make(map[uint64]net.Conn) // connected clients
 var nextMessageSeq uint64 = 1
+var followers = make(map[uint64]map[uint64]struct{})
+
 var queue = make(sequenceQueue, 0)
 var pushEventChan = make(chan Event)
 var heapChanged = make(chan bool)
 var quitChan = make(chan bool)
+
+var mutex = &sync.Mutex{} // for safe modification of the heap with events
 
 func main() {
 	heap.Init(&queue)
@@ -62,7 +67,7 @@ func handleEventRequest(conn net.Conn) {
 	for scanner.Scan() {
 		// Builds the event.
 		nextLine := scanner.Text()
-		log.Println("Event received: ", nextLine, "Next to send:", nextMessageSeq)
+		log.Println("Event received: ", nextLine)
 		event, err := newEventFromString(nextLine)
 		if err != nil {
 			log.Println("Event error:", err)
@@ -77,18 +82,30 @@ func handleEventRequest(conn net.Conn) {
 func pushNewEventToQueue() {
 	for {
 		event := <-pushEventChan
+		mutex.Lock()
 		heap.Push(&queue, event)
+		mutex.Unlock()
 		heapChanged <- true
 	}
 }
 
+// On each heap modification checks if the event with nextMessageSeq sequence number is in the top of the heap and
+// sends the event to proceedEvent
 func watchPriorityQueue() {
 	for {
 		if <-heapChanged {
 			nextMessage := nextMessageSeq
+			log.Println("Next to proceed:", nextMessage)
 			if len(queue) > 0 && queue[0].sequence == nextMessage {
+				mutex.Lock()
 				event := heap.Pop(&queue).(Event)
-				 go proceedEvent(event)
+				mutex.Unlock()
+				go proceedEvent(event)
+				if len(queue) > 0 {
+					log.Printf("Submitted %d. Next in the queue: %d", event.sequence, queue[0].sequence)
+				} else {
+					log.Printf("Submitted %d. The queue is empty", event.sequence)
+				}
 			}
 		}
 	}
@@ -113,12 +130,13 @@ func runClientListener() {
 	}
 }
 
+// Increments nextMessageSeq and notifies heapChanged channel
 func triggerNextHeapCheck(seq uint64) {
 	nextMessageSeq = seq
 	heapChanged <- true
 }
 
-// Decides what to do with the event
+// Dispatches an event
 func proceedEvent(event Event) {
 	defer triggerNextHeapCheck(event.sequence + 1)
 	log.Printf("Proceeding event %s", event.toString())
@@ -128,47 +146,45 @@ func proceedEvent(event Event) {
 		// In case if the event contains the id of the non-registered user
 		if present == false {
 			log.Println("Wrong subscription request, To User Id doesn't exist: ", event.toString())
-			break
-		}
-		client.followers[event.fromUserId] = true
-		go sendMessage(client, event)
-	case "U": // Unfollow. No clients should be notified
-		client, present := clients[event.toUserId]
-		// In case if the event contains the id of the non-registered user
-		if present == false {
-			log.Println("Wrong unfollow request, To User Id doesn't exist: ", event.toString())
-			break
-		}
-		delete(client.followers, event.fromUserId)
-	case "B": // Broadcast. All connected user clients should be notified
-		for _, client := range clients {
+		} else {
 			sendMessage(client, event)
+		}
+		_, initialized := followers[event.toUserId]
+		if initialized == false {
+			followers[event.toUserId] = make(map[uint64]struct{})
+		}
+		followers[event.toUserId][event.fromUserId] = struct{}{} // empty structure is 0 bytes size
+	case "U": // Unfollow. No clients should be notified
+		delete(followers[event.toUserId], event.fromUserId)
+	case "B": // Broadcast. All connected user clients should be notified
+		for clientId := range clients {
+			sendMessage(clients[clientId], event)
 		}
 	case "P": // Private message. Only the `To User Id` should be notified
 		client, present := clients[event.toUserId]
 		if present == false {
-			log.Printf("Discharging the message to the non-registered client")
-			break
-		}
-		sendMessage(client, event)
-	case "S": // Status update. All current followers of the `From User ID` should be notified
-		followers := clients[event.fromUserId].followers
-		for followerId := range followers {
-			client, present := clients[followerId]
-			if present == false {
-				log.Printf("There is no connection registered for subsriber %d. Event %s", followerId,
-					event.toString())
-				break
-			}
+			log.Printf("Discharging the message to the non-registered client %d", event.toUserId)
+		} else {
 			sendMessage(client, event)
+		}
+	case "S": // Status update. All current followers of the `From User ID` should be notified
+		//followers := getKeys(followers[event.fromUserId])
+		for k := range followers[event.fromUserId] {
+			client, present := clients[k]
+			if present == false {
+				log.Printf("There is no connection registered for subsriber %d. Event %s", k,
+					event.toString())
+			} else {
+				sendMessage(client, event)
+			}
 		}
 	}
 }
 
-func sendMessage(client clientConnection, event Event) {
+// Sends the message to the opened connection
+func sendMessage(connection net.Conn, event Event) {
 	log.Printf("Event sent: %s", event.toString())
-	client.connection.Write([]byte(event.toString() + "\n"))
-	return
+	connection.Write([]byte(event.toString() + "\n"))
 }
 
 // Handles client requests. Adds connection to a pool of active connections
@@ -185,14 +201,13 @@ func handleClientRequest(conn net.Conn) {
 		return
 	}
 
-	clientConn := clientConnection{connection: conn, id: clientId, followers: make(map[uint64]bool)}
-	clients[clientId] = clientConn
+	clients[clientId] = conn
 	log.Println("New client connection. ClientID#", clientId)
 }
 
 // Used for closing opened connections from the clients at the end of the execution
 func closeClientConnections() {
 	for _, activeConnection := range clients {
-		activeConnection.connection.Close()
+		activeConnection.Close()
 	}
 }

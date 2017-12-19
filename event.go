@@ -31,10 +31,21 @@ func newEventFromString(stringEvent string) (Event, error) {
 	data := strings.Split(stringEvent, "|")
 
 	switch {
-	case len(data) == 1 || len(data) == 2:
-		return message, fmt.Errorf("event is incomplete %v", stringEvent)
+	case len(data) == 1 || (len(data) == 2 && data[1] != "B"):
+		return message, fmt.Errorf("event is incomplete %v, data: %#v", stringEvent, data)
 	case len(data) > 4:
 		return message, fmt.Errorf("event is too long %v", stringEvent)
+	case len(data) == 2 && data[1] == "B":
+		sequence, err := strconv.ParseUint(data[0], 10, 64)
+		if err != nil {
+			return message, fmt.Errorf("sequence type is not an integer %v", stringEvent)
+		}
+		message.sequence = sequence
+		_, present := allowedEvents[data[1]]
+		if present == false {
+			return message, fmt.Errorf("event type %v is not supported", data[1])
+		}
+		message.msgType = data[1]
 	case len(data) >= 3:
 		sequence, err := strconv.ParseUint(data[0], 10, 64)
 		if err != nil {
